@@ -23,10 +23,10 @@
 
 int errno;
 
-typedef struct MyMessage {
+typedef struct Packet {
 	char flags;
 	long contents;
-} MyMessage;
+} Packet;
 
 /* interval between message sends */
 struct timeval timeout = {
@@ -48,7 +48,7 @@ char *argv[];
 {
 
 	int sock;	/* a socket for sending messages*/
-	MyMessage message;
+	Packet message;
 	struct hostent *host;
 	u_short port;
 	struct sockaddr_in trolladdr, localaddr;
@@ -56,7 +56,7 @@ char *argv[];
 	int counter, n;
 	int arg;
 
-	MyMessage recvbuf;
+	Packet recvbuf;
 
 	/* process arguments */
 

@@ -21,9 +21,9 @@ static char *rcsid = "$Header: /var/home/solomon/640/troll/RCS/fromtroll.c,v 3.2
 
 int errno;
 
-typedef struct MyMessage {
+typedef struct Packet {
 	long contents;
-} MyMessage;
+} Packet;
 
 /* for lint */
 void bzero(), bcopy(), exit(), perror();
@@ -36,7 +36,7 @@ char *argv[];
 {
 
 	int sock;	/* a socket for receiving responses */
-	MyMessage message;
+	Packet message;
 	u_short port;
 	struct sockaddr_in trolladdr, localaddr;
 	int n;
