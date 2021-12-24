@@ -107,8 +107,12 @@ int main(int argc, char *argv[])
     pthread_t senderThread = pthread_t();//(pthread_t *) malloc(sizeof(pthread_t));
 	pthread_t receiverThread = pthread_t();//(pthread_t *) malloc(sizeof(pthread_t));
 
-	pthread_create(&senderThread, NULL, senderMain, NULL);
-	pthread_create(&receiverThread, NULL, receiverMain, NULL);
+	int *arg = malloc(sizeof(*arg));
+	*arg = sock;
+	int *arg2 = malloc(sizeof(*arg));
+	*arg2 = sock;
+	pthread_create(&senderThread, NULL, senderMain, arg);
+	pthread_create(&receiverThread, NULL, receiverMain, arg);
  
 
 	// int msgCount  = 0;
@@ -157,25 +161,10 @@ int main(int argc, char *argv[])
 
 void *senderMain(void *vargs)
 {
-	int sendsock;
+	int sendsock = *((int *) i);
 	struct sockaddr_in addr;
 	Packet sendbuffer;
 	socklen_t len = sizeof(trolladdr);
-
-	if ((sendsock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		perror("sendermain send socket creation error");
-		exit(1);
-	}
-
-	/* ... and bind its local address */
-	bzero((char *)&addr, sizeof addr);
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY; /* let the kernel fill this in */
-	addr.sin_port = htons(port+1);
-	if (bind(sendsock, (struct sockaddr *)&addr, sizeof addr) < 0) {
-		perror("client bind error on sender main");
-		exit(1);
-	}
 
 	std::unique_lock<std::mutex> lck(cvMutex);
 	Packet* packet = nullptr;
@@ -214,28 +203,14 @@ void *senderMain(void *vargs)
 void *receiverMain(void *vargs)
 {
 	int rcvsock;
+	int rcvsock = *((int *) i);
+
 	struct sockaddr_in mylocaladdr;
 	Packet rcvBuffer;
 	Packet ackMsg;
 	size_t rcvbufsize = sizeof rcvBuffer;
 	socklen_t len = sizeof trolladdr;
 
-	if ((rcvsock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-	{
-		perror("receiver main send socket creation error");
-		exit(1);
-	}
-
-	/* ... and bind its local address */
-	bzero((char *)&mylocaladdr, sizeof mylocaladdr);
-	mylocaladdr.sin_family = AF_INET;
-	mylocaladdr.sin_addr.s_addr = INADDR_ANY; /* let the kernel fill this in */
-	mylocaladdr.sin_port = htons(port);
-
-	if (bind(rcvsock, (struct sockaddr *)&mylocaladdr, sizeof mylocaladdr) < 0) {
-		perror("server receiver bind");
-		exit(1);
-	}
 
 	int msgCount = -1;	
 	int lastseq = -1;
