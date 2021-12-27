@@ -1,0 +1,21 @@
+Packet with sequence number in [rcv_base, rcv_base+N-1]is cor-
+
+rectly received. In this case, the received packet falls within the receiver’s win-
+dow and a selective ACK packet is returned to the sender. If the packet was not
+
+previously received, it is buffered. If this packet has a sequence number equal to
+the base of the receive window (rcv_base in Figure 3.22), then this packet,
+and any previously buffered and consecutively numbered (beginning with
+
+rcv_base) packets are delivered to the upper layer. The receive window is
+
+then moved forward by the number of packets delivered to the upper layer. As
+
+an example, consider Figure 3.26. When a packet with a sequence number of
+
+rcv_base=2 is received, it and packets 3, 4, and 5 can be delivered to the
+upper layer.
+2. Packet with sequence number in [rcv_base-N, rcv_base-1]is cor-
+rectly received. In this case, an ACK must be generated, even though this is a
+packet that the receiver has previously acknowledged.
+3. Otherwise. Ignore the packet
