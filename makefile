@@ -1,3 +1,3 @@
 make:
 	g++ servertroll.cpp -o trollserver -lpthread
-	gcc clienttroll.c -o trollclient -lpthread
+	g++ clienttroll.cpp -o trollclient -lpthread

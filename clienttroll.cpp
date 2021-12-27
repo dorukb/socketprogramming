@@ -1,4 +1,5 @@
 /*
+
 Parts of this are taken from fromtroll.c and totroll.c, which are written by:
  * Mitchell Tasman
  * December 1987
@@ -19,6 +20,19 @@ and some parts are taken from getaddrinfo(7) man page.
 #include <iostream>
 #include <string>
 #include <math.h>
+
+#include <stdio.h>
+#include <string.h>
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/signal.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <netdb.h>
+
 
 using namespace std;
 
@@ -63,40 +77,66 @@ sem_t sendWindowShiftedSignal;	// to signal send window shifted, for SenderSR
 
 int main(int argc, char *argv[])
 {
-	int sock;	/* a socket for receiving responses */ 
+	int sock;	/* a socket for sending messages*/
+	Packet message;
+	struct hostent *host;
+	struct sockaddr_in localaddr;
+	fd_set selectmask;
+	int counter, n;
 
-	/* process arguments */
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s port\n", argv[0]);
+	printf("argc: %d\n", argc);
+
+	// 0 is execname, 1 is IP , 2 is troll port, 3 is local port.
+
+	/* get troll address and port ... */
+
+	if ((host = gethostbyname(argv[1])) == NULL) {
+		fprintf(stderr, "%s: Unknown troll host '%s'\n",argv[0],argv[1]);
 		exit(1);
-	}
+	}  
 
-	u_short port = atoi(argv[1]);
+	u_short port = atoi(argv[2]);
 	if (port < 1024 || port > 0xffff) {
 		fprintf(stderr, "%s: Bad troll port %d (must be between 1024 and %d)\n",
 			argv[0], port, 0xffff);
 		exit(1);
 	}
 
-	/* create a socket... */
-	if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		perror("fromtroll socket");
+	bzero ((char *)&trolladdr, sizeof trolladdr);
+	trolladdr.sin_family = AF_INET;
+	bcopy(host->h_addr, (char*)&trolladdr.sin_addr, host->h_length);
+	trolladdr.sin_port = htons(port);
+
+	/* get local port ... */
+
+	port = atoi(argv[3]);
+	if (port < 1024 || port > 0xffff) {
+		fprintf(stderr, "%s: Bad local port %d (must be between 1024 and %d)\n",
+			argv[0], port, 0xffff);
 		exit(1);
 	}
 
-	int optval = 1;
-	setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&optval,sizeof(int));
+	/* create a socket for sending... */
 
-	struct sockaddr_in localaddr;
-	/* ... and bind its local address */
+	if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		perror("totroll socket");
+		exit(1);
+	}
+	FD_ZERO(&selectmask);
+	FD_SET(sock, &selectmask);
+
+	/* ... and bind its local address and the port*/
 	bzero((char *)&localaddr, sizeof localaddr);
 	localaddr.sin_family = AF_INET;
 	localaddr.sin_addr.s_addr = INADDR_ANY; /* let the kernel fill this in */
 	localaddr.sin_port = htons(port);
 	if (bind(sock, (struct sockaddr *)&localaddr, sizeof localaddr) < 0) {
-		perror("server bind");
+		perror("client bind");
 		exit(1);
 	}
+
+	int optval = 1;
+	setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&optval,sizeof(int));
 
     sem_init(&dataQueueMutex, 0, 1);
     sem_init(&ackQueueMutex, 0, 1);
@@ -156,7 +196,7 @@ int main(int argc, char *argv[])
 			p->seqNumber = sendNextSeqNum;	
 			dataPacketSendQueue.push(p);
 
-			sendNextSeqNum++;		
+			sendNextSeqNum++;
 			if(dataPacketSendQueue.size() == 1)
 			{
 				// Wake up SenderSR thread to send this data packet.
@@ -342,16 +382,12 @@ void *receiverMain(void *vargs)
 				// p->contents = "0000000";
 				p->isAck = 1;
 				p->seqNumber = rcvBuffer.seqNumber;
-
 				ackPacketSendQueue.push(p);
 				if(ackPacketSendQueue.size() == 1)
 				{
 					sem_post(&AckQueueNotEmptySignal);
 				}
-
 				sem_post(&ackQueueMutex);
-
-				// Signal sendAckOnly thread that there is now a ACK package to send.
 			}
 		}
 		else{
@@ -359,3 +395,4 @@ void *receiverMain(void *vargs)
 		}
 	}
 }
+
