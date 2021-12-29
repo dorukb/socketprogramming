@@ -53,7 +53,6 @@ long sendNextSeqNum = 0;
 
 int senderSrPacketAckStates[SEND_WINDOW_SIZE];
 long rcvNextSeqNum = 0;
-Packet rcvOutOfOrderPacketBuffer[RCV_WINDOW_SIZE]; // in theory, there couldbe be at most windowSize-1 buffered packages., so 14 also works?
 
 sem_t timersMutex; // to protect timers? for resending
 
@@ -111,11 +110,7 @@ int main(int argc, char *argv[])
 		// 0: unack'ed  , 1; ack'ed
 		senderSrPacketAckStates[i] = 0;
 	}
-	for(int i = 0; i < RCV_WINDOW_SIZE; i++)
-	{
-		rcvOutOfOrderPacketBuffer[i].seqNumber = -1;
-		rcvOutOfOrderPacketBuffer[i].isAck = -1;
-	}
+
     pthread_t senderSRThread = pthread_t();
 	pthread_t senderAckThread = pthread_t();
 	pthread_t receiverThread = pthread_t();
@@ -138,6 +133,10 @@ int main(int argc, char *argv[])
 		getline(std::cin ,line);
 		if(line == "BYE"){
 			fprintf(stderr, "END SIGNAL RECEIVED BY MAIN THREAD\n");
+			break;
+		}
+		if(std::cin.eof()){
+			fprintf(stderr, "End of message. SIGNAL RECEIVED BY MAIN THREAD\n");
 			break;
 		}
 		// keep sending messages, split them into 8byte packages.
@@ -207,10 +206,11 @@ void *senderAckOnly(void *vargs)
 		strncpy(sendbuffer.contents, packet->contents, 8);
 		sendbuffer.isAck = packet->isAck;
 		sendbuffer.seqNumber = packet->seqNumber;
-
 		if(packet->isAck != 1){
 			fprintf(stderr,"this is a data packet. should not be on ACK queue.\n");
 		}
+
+		free(packet);
 
 		// fprintf(stderr, "sending ACK packet\n");
 		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
@@ -262,6 +262,8 @@ void *senderSR(void *vargs)
 		}
 		sendbuffer.seqNumber = packet->seqNumber;
 		fprintf(stderr,"sending DATA packet\n");
+
+		free(packet);
 		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
 						(struct sockaddr *)&trolladdr, len);
 		if (nsent<0) 
@@ -283,9 +285,17 @@ void *receiverMain(void *vargs)
 	socklen_t len = sizeof trolladdr;
 	// Create and open a text file
 
-	long rcvBaseSeqNum = 0;
+	int rcvBaseSeqNum = 0;
   	ofstream chatOutput;
 
+	Packet rcvOutOfOrderPacketBuffer[RCV_WINDOW_SIZE]; // in theory, there couldbe be at most windowSize-1 buffered packages., so 14 also works?
+	for(int i = 0; i < RCV_WINDOW_SIZE; i++)
+	{
+		rcvOutOfOrderPacketBuffer[i].checksum = 0;
+		strncpy(rcvOutOfOrderPacketBuffer[i].contents , "0000000", 8);
+		rcvOutOfOrderPacketBuffer[i].seqNumber = -1;
+		rcvOutOfOrderPacketBuffer[i].isAck = -1;
+	}
 	while(true)
 	{
 		// fprintf(stderr,"Server waiting for new message.\n");
@@ -320,7 +330,8 @@ void *receiverMain(void *vargs)
 					// loop thru senderSrPacketAckStates and find the first 0? would that work?
 
 					// let senderSR know that it can now send prev buffered(due to invalid seq num) packets if any.
-					sem_post(&sendWindowShiftedSignal);
+					// fprintf(stderr, "Posting send window shift signal\n");
+					// sem_post(&sendWindowShiftedSignal);
 				}
 			}
 			else
@@ -351,9 +362,9 @@ void *receiverMain(void *vargs)
 
 				// check if received/buffered before
 				bool alreadyBuffered = false;
-				for(int i = 0; i < RCV_WINDOW_SIZE; i++)
+				for(int j = 0; j < RCV_WINDOW_SIZE; j++)
 				{
-					if(rcvOutOfOrderPacketBuffer[i].seqNumber == rcvBuffer.seqNumber)
+					if(rcvOutOfOrderPacketBuffer[j].seqNumber == rcvBuffer.seqNumber)
 					{
 						alreadyBuffered = true;
 					}
@@ -366,12 +377,22 @@ void *receiverMain(void *vargs)
 						if(rcvOutOfOrderPacketBuffer[i].seqNumber == -1) // marked as empty
 						{
 							// Buffer the packet content for later in-order delivery
+							fprintf(stderr,"Buffer packet seqNo: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
+
 							rcvOutOfOrderPacketBuffer[i].checksum = rcvBuffer.checksum;
 							strncpy(rcvOutOfOrderPacketBuffer[i].contents, rcvBuffer.contents, 8);
 							rcvOutOfOrderPacketBuffer[i].isAck = rcvBuffer.isAck;
 							rcvOutOfOrderPacketBuffer[i].seqNumber = rcvBuffer.seqNumber;
+							break;
+						}
+						else
+						{							
+							fprintf(stderr,"rcv base: %d buffered packet seqNo: %d\n", rcvBuffer.seqNumber, rcvOutOfOrderPacketBuffer[i].seqNumber);							
 						}
 					}
+				}
+				else{
+					fprintf(stderr,"Already buffered packet seqNo: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
 				}
 				// if in-order, deliver all buffered packets
 				if(rcvBuffer.seqNumber == rcvBaseSeqNum)
@@ -381,6 +402,8 @@ void *receiverMain(void *vargs)
 					fprintf(stderr,"In order packet with seqNum: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
 					for(int i = 0; i < RCV_WINDOW_SIZE; i++)
 					{
+						// fprintf(stderr, "base seq:%d, buffEREDPacketSeq: %d\n", rcvBaseSeqNum, rcvOutOfOrderPacketBuffer[i].seqNumber);
+
 						for(int j = 0; j < RCV_WINDOW_SIZE; j++)
 						{
 							// Find current smallest packet. its number should be the baseSeqNumber.
@@ -400,6 +423,8 @@ void *receiverMain(void *vargs)
 								chatOutput << smallest.contents;
 								chatOutput.close();
 								break;
+							}
+							else{
 							}
 						}
 					}

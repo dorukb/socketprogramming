@@ -29,11 +29,19 @@ and some parts are taken from getaddrinfo(7) man page.
 #include <fstream>
 #include <iostream>
 
+
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 using namespace std;
 
-void *senderAckOnly(void *vargs);
-void *senderSR(void *vargs);
-void *receiverMain(void *vargs);
+void senderAckOnly(int s);
+void senderSR(int s);
+void receiverMain(int s);
+
+// void *senderAckOnly(void *vargs);
+// void *senderSR(void *vargs);
+// void *receiverMain(void *vargs);
 
 typedef struct Packet {
 	char isAck;
@@ -47,10 +55,15 @@ struct sockaddr_in trolladdr;
 
 // Global vars that need sync
 queue<Packet*> dataPacketSendQueue;
-sem_t dataQueueMutex; // to protect dataPacketSendQueue
+mutex dataQueueMutex;
+std::condition_variable cvDataNotEmpty;
+// sem_t dataQueueMutex; // to protect dataPacketSendQueue
 
 queue<Packet*> ackPacketSendQueue;
-sem_t ackQueueMutex;
+mutex ackQueueMutex;
+std::condition_variable cvAckNotEmpty;
+
+// sem_t ackQueueMutex;
 
 // since this is both sender & receiver, we have two sets of variables for Selective Repeat.
 long sendBaseSeqNum = 0;
@@ -60,13 +73,13 @@ long sendNextSeqNum = 0;
 #define RCV_WINDOW_SIZE 15
 
 int senderSrPacketAckStates[SEND_WINDOW_SIZE];
+// sem_t timersMutex; // to protect timers? for resending
 
-Packet rcvOutOfOrderPacketBuffer[RCV_WINDOW_SIZE]; // in theory, there couldbe be at most windowSize-1 buffered packages., so 14 also works?
-sem_t timersMutex; // to protect timers? for resending
+// sem_t DataQueueNotEmptySignal; // to signal there is a data packet to send.
+// sem_t AckQueueNotEmptySignal;	// to signal there is an ACK packet to send.
+// sem_t sendWindowShiftedSignal;	// to signal send window shifted, for SenderSR
 
-sem_t DataQueueNotEmptySignal; // to signal there is a data packet to send.
-sem_t AckQueueNotEmptySignal;	// to signal there is an ACK packet to send.
-sem_t sendWindowShiftedSignal;	// to signal send window shifted, for SenderSR
+
 
 int main(int argc, char *argv[])
 {
@@ -131,46 +144,49 @@ int main(int argc, char *argv[])
 	int optval = 1;
 	setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&optval,sizeof(int));
 
-    sem_init(&dataQueueMutex, 0, 1);
-    sem_init(&ackQueueMutex, 0, 1);
-    sem_init(&timersMutex, 0, 1);
+    // sem_init(&dataQueueMutex, 0, 1);
+    // sem_init(&ackQueueMutex, 0, 1);
+    // sem_init(&timersMutex, 0, 1);
 
-	sem_init(&DataQueueNotEmptySignal, 0, 0);
-	sem_init(&AckQueueNotEmptySignal, 0, 0);
-	sem_init(&sendWindowShiftedSignal, 0, 0);
+	// sem_init(&DataQueueNotEmptySignal, 0, 0);
+	// sem_init(&AckQueueNotEmptySignal, 0, 0);
+	// sem_init(&sendWindowShiftedSignal, 0, 0);
 
 	for(int i = 0 ; i < SEND_WINDOW_SIZE; i++)
 	{
 		// 0: unack'ed  , 1; ack'ed
 		senderSrPacketAckStates[i] = 0;
 	}
-	for(int i = 0; i < RCV_WINDOW_SIZE; i++)
-	{
-		rcvOutOfOrderPacketBuffer[i].seqNumber = -1;
-		rcvOutOfOrderPacketBuffer[i].isAck = -1;
-	}
-    pthread_t senderSRThread = pthread_t();
-	pthread_t senderAckThread = pthread_t();
-	pthread_t receiverThread = pthread_t();
 
-	int *arg = (int*)malloc(sizeof(int));
-	*arg = sock;
-	int *arg2 = (int*)malloc(sizeof(int));
-	*arg2 = sock;
-	int *arg3 = (int*)malloc(sizeof(int));
-	*arg3 = sock;
+    // pthread_t senderSRThread = pthread_t();
+	// pthread_t senderAckThread = pthread_t();
+	// pthread_t receiverThread = pthread_t();
 
-	pthread_create(&senderSRThread, NULL, senderSR, arg);
-	pthread_create(&receiverThread, NULL, receiverMain, arg2);
-	pthread_create(&senderAckThread, NULL, senderAckOnly, arg3);
+	// int *arg = (int*)malloc(sizeof(int));
+	// *arg = sock;
+	// int *arg2 = (int*)malloc(sizeof(int));
+	// *arg2 = sock;
+	// int *arg3 = (int*)malloc(sizeof(int));
+	// *arg3 = sock;
 
+	// pthread_create(&senderSRThread, NULL, senderSR, arg);
+	// pthread_create(&receiverThread, NULL, receiverMain, arg2);
+	// pthread_create(&senderAckThread, NULL, senderAckOnly, arg3);
+
+	thread senderSrThread(senderSR,sock);
+	thread receiverThread(receiverMain, sock);
+	thread senderAckThread(senderAckOnly, sock);
 
 	string line;
 	while(true)
 	{
 		getline(std::cin ,line);
-		if(line == "BYE"){
+		if(line == "BYE" ){
 			fprintf(stderr, "END SIGNAL RECEIVED BY MAIN THREAD\n");
+			break;
+		}
+		if(std::cin.eof()){
+			fprintf(stderr, "End of message. SIGNAL RECEIVED BY MAIN THREAD\n");
 			break;
 		}
 		// keep sending messages, split them into 8byte packages.
@@ -184,35 +200,59 @@ int main(int argc, char *argv[])
 
 			// printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
 
-			sem_wait(&dataQueueMutex);
-			Packet *p = (Packet *) malloc(sizeof(Packet));
-			strncpy(p->contents, chunk.c_str(), 8);
-			p->isAck = 0;
-			p->seqNumber = sendNextSeqNum;	
-			dataPacketSendQueue.push(p);
-
-			sendNextSeqNum++;
-			if(dataPacketSendQueue.size() == 1)
 			{
-				// Wake up SenderSR thread to send this data packet.
-				// fprintf(stderr, "data q not empty SIGNALED by main\n");
-				sem_post(&DataQueueNotEmptySignal);
+				printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
+				unique_lock<mutex>mlock(dataQueueMutex);
+				Packet *p = (Packet *) malloc(sizeof(Packet));
+				strncpy(p->contents, chunk.c_str(), 8);
+				p->isAck = 0;
+				p->seqNumber = sendNextSeqNum;	
+				dataPacketSendQueue.push(p);
+
+				sendNextSeqNum++;
+				fprintf(stderr, "data q not empty SIGNALED by main\n");
+				cvDataNotEmpty.notify_one();
 			}
-			sem_post(&dataQueueMutex);
+			// dataQueueMutex.lock();
+			// sem_wait(&dataQueueMutex);
+
+			// Packet *p = (Packet *) malloc(sizeof(Packet));
+			// strncpy(p->contents, chunk.c_str(), 8);
+			// p->isAck = 0;
+			// p->seqNumber = sendNextSeqNum;	
+			// dataPacketSendQueue.push(p);
+
+			// sendNextSeqNum++;
+			// if(dataPacketSendQueue.size() == 1)
+			// {
+			// 	// Wake up SenderSR thread to send this data packet.
+			// 	fprintf(stderr, "data q not empty SIGNALED by main\n");
+
+			// 	// sem_post(&dataQueueMutex);
+			// 	dataQueueMutex.unlock();
+			// 	cvDataNotEmpty.notify_all();
+			// 	// sem_post(&DataQueueNotEmptySignal);
+			// }
+			// else{
+			// 	// sem_post(&dataQueueMutex);
+			// 	dataQueueMutex.unlock();
+			// }
 		}
 	}
-	pthread_join(senderSRThread, NULL);
-	pthread_join(receiverThread, NULL);
-	pthread_join(senderAckThread, NULL);
+	// pthread_join(senderSRThread, NULL);
+	// pthread_join(receiverThread, NULL);
+	// pthread_join(senderAckThread, NULL);
+	senderAckThread.join();
+	senderSrThread.join();
+	senderAckThread.join();
 
 	close(sock);
 
 	return 0;
 }
-
-void *senderAckOnly(void *vargs)
+void senderAckOnly(int sock)
 {
-	int sendsock = *((int *) vargs);
+	int sendsock = sock;//*((int *) vargs);
 	struct sockaddr_in addr;
 	Packet sendbuffer;
 	socklen_t len = sizeof(trolladdr);
@@ -221,29 +261,45 @@ void *senderAckOnly(void *vargs)
 	while(1)
 	{
 		// fprintf(stderr, "waiting on ack q mutex\n");
-		sem_wait(&ackQueueMutex);
-		if(ackPacketSendQueue.empty())
+		// sem_wait(&ackQueueMutex);
+		// fprintf(stderr,"waiting on ACK q not empty\n");
+		// Acquire the lock
+
 		{
-			sem_post(&ackQueueMutex);
+			fprintf(stderr, "waiting on ack q mutex\n");
+			std::unique_lock<std::mutex> mlock(ackQueueMutex);
+			while(ackPacketSendQueue.empty())
+			{
+				fprintf(stderr,"waiting on ACK q not empty\n");
+				cvAckNotEmpty.wait(mlock);
+			}
 
-			// fprintf(stderr,"waiting on ACK q not empty\n");
-			sem_wait(&AckQueueNotEmptySignal);
-
-			sem_wait(&ackQueueMutex);
-			// fprintf(stderr, "ACK q not empty received\n");
-
+			// get the package, copy over to our buffer
+			packet = ackPacketSendQueue.front();
+			ackPacketSendQueue.pop();
 		}
+	
+
+		// if(ackPacketSendQueue.empty())
+		// {
+		// 	sem_post(&ackQueueMutex);	
+		// 	// sem_wait(&AckQueueNotEmptySignal);
+		// 	sem_wait(&ackQueueMutex);
+		// 	// fprintf(stderr, "ACK q not empty received\n");
+		// }
 
 		// get the package, copy over to our buffer
-		packet = ackPacketSendQueue.front();
-		ackPacketSendQueue.pop();
+		// packet = ackPacketSendQueue.front();
+		// ackPacketSendQueue.pop();
 		strncpy(sendbuffer.contents, packet->contents, 8);
 		sendbuffer.isAck = packet->isAck;
 		sendbuffer.seqNumber = packet->seqNumber;
-
 		if(packet->isAck != 1){
 			fprintf(stderr,"this is a data packet. should not be on ACK queue.\n");
 		}
+
+		free(packet);
+
 
 		// fprintf(stderr, "sending ACK packet\n");
 		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
@@ -251,15 +307,17 @@ void *senderAckOnly(void *vargs)
 		if (nsent<0) 
 		{
 			perror("server send response error\n");
-			sem_post(&ackQueueMutex);
+			// sem_post(&ackQueueMutex);
+			// mlock.unlock();
 			exit(1);
 		}
-		sem_post(&ackQueueMutex);
+		// sem_post(&ackQueueMutex);
+		// mlock.unlock();
 	}
 }
-void *senderSR(void *vargs)
+void senderSR(int sock)
 {
-	int sendsock = *((int *) vargs);
+	int sendsock = sock;//*((int *) vargs);
 	struct sockaddr_in addr;
 	Packet sendbuffer;
 	socklen_t len = sizeof(trolladdr);
@@ -268,47 +326,59 @@ void *senderSR(void *vargs)
 
 	while(1)
 	{
-		fprintf(stderr, "waiting on data Q mutex\n");
-		sem_wait(&dataQueueMutex);
+		// fprintf(stderr, "waiting on data Q mutex\n");
+		// sem_wait(&dataQueueMutex);
 		
-		if(dataPacketSendQueue.empty())
-		{
-			sem_post(&dataQueueMutex);
-			fprintf(stderr, "waiting on data queue not empty\n");
-			sem_wait(&DataQueueNotEmptySignal);
+		// while(dataPacketSendQueue.empty())
+		// {
+		// 	sem_post(&dataQueueMutex);
+		// 	fprintf(stderr, "waiting on data queue not empty\n");
+		// 	sem_wait(&DataQueueNotEmptySignal);
 
-			sem_wait(&dataQueueMutex);
-			fprintf(stderr, "data queue not empty received\n");
-		}
+		// 	sem_wait(&dataQueueMutex);
+		// 	fprintf(stderr, "data queue not empty received\n");
+		// }
 
 		// get the package, copy over to our buffer
-
-		packet = dataPacketSendQueue.front();
-		dataPacketSendQueue.pop();
-
-		strncpy(sendbuffer.contents, packet->contents, 8);
-		// sendbuffer.contents = packet->contents;
-
-		sendbuffer.isAck = packet->isAck;
-		if(packet->isAck != 0){
-			fprintf(stderr, "ACK packet no: %d should not be on data queue.\n", packet->seqNumber);
-		}
-		sendbuffer.seqNumber = packet->seqNumber;
-		fprintf(stderr,"sending DATA packet\n");
-		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
-						(struct sockaddr *)&trolladdr, len);
-		if (nsent<0) 
 		{
-			perror("server send response error");
-			sem_post(&dataQueueMutex);
-			exit(1);
+			fprintf(stderr, "waiting on data Q mutex\n");
+			std::unique_lock<std::mutex> mlock(dataQueueMutex);
+			while(dataPacketSendQueue.empty())
+			{
+				fprintf(stderr, "waiting on data queue not empty\n");
+				cvDataNotEmpty.wait(mlock);
+			}
+			packet = dataPacketSendQueue.front();
+			dataPacketSendQueue.pop();
+
+			strncpy(sendbuffer.contents, packet->contents, 8);
+			// sendbuffer.contents = packet->contents;
+
+			sendbuffer.isAck = packet->isAck;
+			if(packet->isAck != 0){
+				fprintf(stderr, "ACK packet no: %d should not be on data queue.\n", packet->seqNumber);
+			}
+			sendbuffer.seqNumber = packet->seqNumber;
+			fprintf(stderr,"sending DATA packet\n");
+
+			free(packet);
+			int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
+							(struct sockaddr *)&trolladdr, len);
+			if (nsent<0) 
+			{
+				perror("server send response error");
+				// sem_post(&dataQueueMutex);
+				// mlock.unlock();
+				exit(1);
+			}
+			// sem_post(&dataQueueMutex);
+			// mlock.unlock();
 		}
-		sem_post(&dataQueueMutex);
 	}
 }
-void *receiverMain(void *vargs)
+void receiverMain(int sock)
 {
-	int rcvsock = *((int *) vargs);
+	int rcvsock = sock; //*((int *) vargs);
 
 	struct sockaddr_in mylocaladdr;
 	Packet rcvBuffer;
@@ -316,9 +386,17 @@ void *receiverMain(void *vargs)
 	socklen_t len = sizeof trolladdr;
 	// Create and open a text file
 
+	int rcvBaseSeqNum = 0;
   	ofstream chatOutput;
-	long rcvBaseSeqNum = 0;
 
+	Packet rcvOutOfOrderPacketBuffer[RCV_WINDOW_SIZE]; // in theory, there couldbe be at most windowSize-1 buffered packages., so 14 also works?
+	for(int i = 0; i < RCV_WINDOW_SIZE; i++)
+	{
+		rcvOutOfOrderPacketBuffer[i].checksum = 0;
+		strncpy(rcvOutOfOrderPacketBuffer[i].contents , "0000000", 8);
+		rcvOutOfOrderPacketBuffer[i].seqNumber = -1;
+		rcvOutOfOrderPacketBuffer[i].isAck = -1;
+	}
 	while(true)
 	{
 		// fprintf(stderr,"Server waiting for new message.\n");
@@ -353,7 +431,8 @@ void *receiverMain(void *vargs)
 					// loop thru senderSrPacketAckStates and find the first 0? would that work?
 
 					// let senderSR know that it can now send prev buffered(due to invalid seq num) packets if any.
-					sem_post(&sendWindowShiftedSignal);
+					// fprintf(stderr, "Posting send window shift signal\n");
+					// sem_post(&sendWindowShiftedSignal);
 				}
 			}
 			else
@@ -365,28 +444,49 @@ void *receiverMain(void *vargs)
 		else if(rcvBuffer.isAck == 0)
 		{
 			// Received data packet, do as needed for ReceiverSR behaviour.
-			int maxAcceptableSeqNum = rcvBaseSeqNum + RCV_WINDOW_SIZE -1;
+			int maxAcceptableSeqNum = rcvBaseSeqNum + (RCV_WINDOW_SIZE -1);
 			if(rcvBuffer.seqNumber >= rcvBaseSeqNum && rcvBuffer.seqNumber <= maxAcceptableSeqNum)
 			{
-				// send ACK
-				sem_wait(&ackQueueMutex);
-				Packet *p = (Packet *) malloc(sizeof(Packet));
-				strncpy(p->contents, "0000000", 8);
-				p->isAck = 1;
-				p->seqNumber = rcvBuffer.seqNumber;
-				ackPacketSendQueue.push(p);
-				if(ackPacketSendQueue.size() == 1)
 				{
-					// Signal sendAckOnly thread that there is now a ACK package to send.
-					sem_post(&AckQueueNotEmptySignal);
+					fprintf(stderr, "waiting on ackQmut to push ACK packet\n");
+
+					unique_lock<mutex>mlock(ackQueueMutex);
+					Packet *p = (Packet *) malloc(sizeof(Packet));
+					strncpy(p->contents, "0000000", 8);
+					p->isAck = 1;
+					p->seqNumber = rcvBuffer.seqNumber;
+					ackPacketSendQueue.push(p);
+
+					fprintf(stderr, "Signaled ACK NOT EMPTY\n");
+					cvAckNotEmpty.notify_one();
 				}
-				sem_post(&ackQueueMutex);
+
+				// send ACK
+				// sem_wait(&ackQueueMutex);
+				// Packet *p = (Packet *) malloc(sizeof(Packet));
+				// strncpy(p->contents, "0000000", 8);
+				// p->isAck = 1;
+				// p->seqNumber = rcvBuffer.seqNumber;
+				// ackPacketSendQueue.push(p);
+				// if(ackPacketSendQueue.size() == 1)
+				// {
+				// 	// Signal sendAckOnly thread that there is now a ACK package to send.
+					
+				// 	// sem_post(&ackQueueMutex);
+				// 	// sem_post(&AckQueueNotEmptySignal);
+				// 	ackQueueMutex.unlock();
+				// 	cvAckNotEmpty.notify_all();
+				// }
+				// else{
+				// 	ackQueueMutex.unlock();
+				// 	// sem_post(&ackQueueMutex);
+				// }
 
 				// check if received/buffered before
 				bool alreadyBuffered = false;
-				for(int i = 0; i < RCV_WINDOW_SIZE; i++)
+				for(int j = 0; j < RCV_WINDOW_SIZE; j++)
 				{
-					if(rcvOutOfOrderPacketBuffer[i].seqNumber == rcvBuffer.seqNumber)
+					if(rcvOutOfOrderPacketBuffer[j].seqNumber == rcvBuffer.seqNumber)
 					{
 						alreadyBuffered = true;
 					}
@@ -399,12 +499,18 @@ void *receiverMain(void *vargs)
 						if(rcvOutOfOrderPacketBuffer[i].seqNumber == -1) // marked as empty
 						{
 							// Buffer the packet content for later in-order delivery
+							fprintf(stderr,"Buffer packet seqNo: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
+
 							rcvOutOfOrderPacketBuffer[i].checksum = rcvBuffer.checksum;
 							strncpy(rcvOutOfOrderPacketBuffer[i].contents, rcvBuffer.contents, 8);
 							rcvOutOfOrderPacketBuffer[i].isAck = rcvBuffer.isAck;
 							rcvOutOfOrderPacketBuffer[i].seqNumber = rcvBuffer.seqNumber;
+							break;
 						}
 					}
+				}
+				else{
+					fprintf(stderr,"Already buffered packet seqNo: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
 				}
 				// if in-order, deliver all buffered packets
 				if(rcvBuffer.seqNumber == rcvBaseSeqNum)
@@ -425,8 +531,11 @@ void *receiverMain(void *vargs)
 								rcvOutOfOrderPacketBuffer[j].seqNumber = -1; // mark as deleted.
 
 								fprintf(stderr, "Deliver packet seqNo: %d, content: %s\n", rcvBaseSeqNum, smallest.contents);
+								// shift receive window
 								rcvBaseSeqNum += 1;
-								chatOutput.open("clientOutput.txt", std::ios_base::app); // append instead of overwrite
+								fprintf(stderr, "rcv base is now:%d\n", rcvBaseSeqNum);
+
+								chatOutput.open("serverOutput.txt", std::ios_base::app); // append instead of overwrite
 								chatOutput << smallest.contents;
 								chatOutput.close();
 								break;
@@ -436,7 +545,7 @@ void *receiverMain(void *vargs)
 				}
 				else
 				{
-					fprintf(stderr,"Out-of-order packet with seqNum: %d and content: %s\n", rcvBuffer.seqNumber, rcvBuffer.contents);
+					fprintf(stderr,"Out-of-order packet with seqNum: %d and content: %s, baseNum:%d\n", rcvBuffer.seqNumber, rcvBuffer.contents, rcvBaseSeqNum);
 				}
 			
 			}
@@ -445,23 +554,44 @@ void *receiverMain(void *vargs)
 				fprintf(stderr,"ACK'ing previously ACK'ed packet. seqNo: %d\n", rcvBuffer.seqNumber);
 				// we have ACK'ed this before, but prob got lost. send ACK again.
 				// send ACK
-				sem_wait(&ackQueueMutex);
-				Packet *p = (Packet *) malloc(sizeof(Packet));
-				strncpy(p->contents, "0000000", 8);
-				p->isAck = 1;
-				p->seqNumber = rcvBuffer.seqNumber;
-				ackPacketSendQueue.push(p);
-				if(ackPacketSendQueue.size() == 1)
+
 				{
-					// Signal sendAckOnly thread that there is now a ACK package to send.
-					sem_post(&AckQueueNotEmptySignal);
+					fprintf(stderr, "waiting on ackQmut to push ACK packet PREV ACK\n");
+					unique_lock<mutex>mlock(ackQueueMutex);
+					Packet *p = (Packet *) malloc(sizeof(Packet));
+					strncpy(p->contents, "0000000", 8);
+					p->isAck = 1;
+					p->seqNumber = rcvBuffer.seqNumber;
+					ackPacketSendQueue.push(p);
+					fprintf(stderr, "ACKNOT EMPT SIGNALED\n");
+
+					cvAckNotEmpty.notify_one();
 				}
-				sem_post(&ackQueueMutex);
+
+				// ackQueueMutex.lock();
+				// // sem_wait(&ackQueueMutex);
+
+				// Packet *p = (Packet *) malloc(sizeof(Packet));
+				// strncpy(p->contents, "0000000", 8);
+				// p->isAck = 1;
+				// p->seqNumber = rcvBuffer.seqNumber;
+				// ackPacketSendQueue.push(p);
+				// if(ackPacketSendQueue.size() == 1)
+				// {
+				// 	// Signal sendAckOnly thread that there is now a ACK package to send.
+				// 	// sem_post(&AckQueueNotEmptySignal);
+				// 	ackQueueMutex.unlock();
+				// 	cvAckNotEmpty.notify_all();
+				// }
+				// else{
+				// 	// sem_post(&ackQueueMutex);
+				// 	ackQueueMutex.unlock();
+				// }
 
 			}
 			else
 			{
-				fprintf(stderr, "packet ignored seqNum: %d rcvbase:%d\n", rcvBuffer.seqNumber, rcvBaseSeqNum);
+				fprintf(stderr, "packet ignored seqNum: %d, rcvbase:%d\n", rcvBuffer.seqNumber, rcvBaseSeqNum);
 			}
 		}
 		else
