@@ -40,7 +40,8 @@ Rest belongs to Doruk Bildibay, e2237089.
 
 using namespace std;
 
-const string outFilename("serverOut.txt");
+// string outFilename("serverOut.txt");
+bool endFlag = false;
 
 void senderAckOnly(int s);
 void senderSR(int s);
@@ -90,6 +91,8 @@ long sendNextSeqNum = 0;
 
 int senderSrPacketAckStates[SEND_SEQ_NUM_SPACE];
 
+
+// Fletchers 8 bit checksum algorithm, as given in the wikipedia page.
 uint16_t Fletcher16(uint8_t *data, int count)
 {
    uint16_t sum1 = 0;
@@ -155,6 +158,7 @@ int main(int argc, char *argv[])
 	{
 		getline(std::cin ,line);
 		if(line == "BYE" ){
+			endFlag = true;
 			fprintf(stderr, "END SIGNAL RECEIVED BY MAIN THREAD\n");
 			break;
 		}
@@ -163,8 +167,9 @@ int main(int argc, char *argv[])
 			break;
 		}
 		// keep sending messages, split them into 8byte packages.
+		line.append("\n");
 		int numOfPacketsNeeded = ceil(line.size() / 8.0);
-		fprintf(stderr, "received inp: %s\n , size:%d , numPack: %d", line, line.size(), numOfPacketsNeeded);
+		fprintf(stderr, "received inp: %s\n , size:%d , numPack: %d\n", line, line.size(), numOfPacketsNeeded);
 		for(int i = 0; i < numOfPacketsNeeded; i++)
 		{
 			// split into packets of at most 8 bytes/chars.
@@ -186,7 +191,7 @@ int main(int argc, char *argv[])
 			}
 			// printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
 			{
-				printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
+				fprintf(stderr,"main waiting fo dataqmutex with chunk: %s\n", chunk);
 				unique_lock<mutex>mlock(dataQueueMutex);
 
 				// Here we need to wait if data packet send queue is FULL.
@@ -225,7 +230,7 @@ void senderAckOnly(int sock)
 	socklen_t len = sizeof(trolladdr);
 	Packet* packet = nullptr;
 
-	while(1)
+	while(!endFlag)
 	{
 		{
 			fprintf(stderr, "waiting on ack q mutex\n");
@@ -234,6 +239,7 @@ void senderAckOnly(int sock)
 			{
 				fprintf(stderr,"waiting on ACK q not empty\n");
 				cvAckNotEmpty.wait(mlock);
+				if(endFlag)return;
 			}
 
 			// get the package, copy over to our buffer
@@ -275,7 +281,7 @@ void senderSR(int sock)
 
 	Packet* packet = nullptr;
 
-	while(1)
+	while(!endFlag)
 	{
 		// get the package, copy over to our buffer
 		{
@@ -286,6 +292,7 @@ void senderSR(int sock)
 				{
 					fprintf(stderr, "waiting on data queue not empty\n");
 					cvDataNotEmpty.wait(mlock);
+					if(endFlag)return;
 				}
 				packet = dataPacketSendQueue.front();
 				dataPacketSendQueue.pop();
@@ -349,7 +356,7 @@ void receiverMain(int sock)
 		rcvOutOfOrderPacketBuffer[i].seqNumber = -1;
 		rcvOutOfOrderPacketBuffer[i].isAck = -1;
 	}
-	while(true)
+	while(!endFlag)
 	{
 		// fprintf(stderr,"Server waiting for new message.\n");
 		int n = recvfrom(rcvsock, (char *)&rcvBuffer, rcvbufsize, 0,
@@ -524,9 +531,10 @@ void receiverMain(int sock)
 								rcvBaseSeqNum = (rcvBaseSeqNum+1) % RCV_SEQ_NUM_SPACE;
 								fprintf(stderr, "rcv base is now:%d\n", rcvBaseSeqNum);
 
-								chatOutput.open(outFilename, std::ios_base::app); // append instead of overwrite
-								chatOutput << smallest.contents;
-								chatOutput.close();
+								// chatOutput.open(outFilename, std::ios_base::app); // append instead of overwrite
+								// chatOutput << smallest.contents;
+								printf(smallest.contents);
+								// chatOutput.close();
 								break;
 							}
 						}
@@ -596,12 +604,12 @@ void receiverMain(int sock)
 void Timers(int sock)
 {
 	// 50 ms timer for each.
-	int64_t timeout = 50;
+	int64_t timeout = 30;
 
 	Packet sendbuffer;	
 	socklen_t len = sizeof(trolladdr);
 
-	while(1)
+	while(!endFlag)
 	{
 		{
 			unique_lock<mutex> mlock(timersMutex);
@@ -630,6 +638,6 @@ void Timers(int sock)
 				}
 			}
 		}
-		std::this_thread::sleep_for(10ms);
+		std::this_thread::sleep_for(5ms);
 	}
 }

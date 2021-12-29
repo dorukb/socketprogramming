@@ -179,9 +179,10 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "End of message. seqNum:%d  data:%s\n\n\n\n", sendNextSeqNum, line);
 			break;
 		}
+		line.append("\n");
 		// keep sending messages, split them into 8byte packages.
 		int numOfPacketsNeeded = ceil(line.size() / 8.0);
-		fprintf(stderr, "received inp: %s\n , size:%d , numPack: %d", line, line.size(), numOfPacketsNeeded);
+		fprintf(stderr, "received inp: %s\n , size:%d , numPack: %d\n", line, line.size(), numOfPacketsNeeded);
 		for(int i = 0; i < numOfPacketsNeeded; i++)
 		{
 			// split into packets of at most 8 bytes/chars.
@@ -201,7 +202,7 @@ int main(int argc, char *argv[])
 			}
 			// printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
 			{
-				printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
+				fprintf(stderr, "main waiting fo dataqmutex with chunk: %s\n", chunk);
 				unique_lock<mutex>mlock(dataQueueMutex);
 
 				// Here we need to wait if data packet send queue is FULL.
@@ -541,9 +542,10 @@ void receiverMain(int sock)
 								rcvBaseSeqNum = (rcvBaseSeqNum+1) % RCV_SEQ_NUM_SPACE;
 								fprintf(stderr, "rcv base is now:%d\n", rcvBaseSeqNum);
 
-								chatOutput.open(outFilename, std::ios_base::app); // append instead of overwrite
-								chatOutput << smallest.contents;
-								chatOutput.close();
+								printf(smallest.contents);
+								// chatOutput.open(outFilename, std::ios_base::app); // append instead of overwrite
+								// chatOutput << smallest.contents;
+								// chatOutput.close();
 								break;
 							}
 						}
