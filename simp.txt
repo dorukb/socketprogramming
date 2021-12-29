@@ -1,0 +1,5 @@
+Data received from above. When data is received from above, the SR sender
+checks the next available sequence number for the packet.If the sequence
+number is within the sender’s window, the data is packetized and sent; other-
+wise it is either buffered or returned to the upper layer for later transmission,
+as in GBN.

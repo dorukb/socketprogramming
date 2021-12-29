@@ -50,7 +50,7 @@ void receiverMain(int s);
 typedef struct Packet {
 	char isAck;
 	int seqNumber;
-	int checksum;
+	long checksum;
 	char contents[8];
 } Packet;
 
@@ -66,6 +66,8 @@ queue<Packet*> ackPacketSendQueue;
 mutex ackQueueMutex;
 std::condition_variable cvAckNotEmpty;
 
+std::condition_variable cvSendWindowShifted;
+mutex mSendWindowShifted;
 
 // since this is both sender & receiver, we have two sets of variables for Selective Repeat.
 long sendBaseSeqNum = 0;
@@ -73,8 +75,26 @@ long sendNextSeqNum = 0;
 
 #define SEND_WINDOW_SIZE 15
 #define RCV_WINDOW_SIZE 15
+#define SEND_SEQ_NUM_SPACE 50
+#define RCV_SEQ_NUM_SPACE 50
 
-int senderSrPacketAckStates[SEND_WINDOW_SIZE];
+// send seq num space client = receive num space of server
+// rcv seqnum space of client = send num space of server!
+
+int senderSrPacketAckStates[SEND_SEQ_NUM_SPACE];
+
+uint16_t Fletcher16(uint8_t *data, int count)
+{
+   uint16_t sum1 = 0;
+   uint16_t sum2 = 0;
+
+   for (int i = 0; i < count; i++)
+   {
+      sum1 = (sum1 + data[i]) % 255;
+      sum2 = (sum2 + sum1) % 255;
+   }
+   return (sum2 << 8) | sum1;
+}
 
 int main(int argc, char *argv[])
 {
@@ -121,16 +141,17 @@ int main(int argc, char *argv[])
   	thread senderSrThread(senderSR,sock);
 	thread receiverThread(receiverMain, sock);
 	thread senderAckThread(senderAckOnly, sock);
-	string line;
+
+		string line;
 	while(true)
 	{
 		getline(std::cin ,line);
-		if(line == "BYE"){
+		if(line == "BYE" ){
 			fprintf(stderr, "END SIGNAL RECEIVED BY MAIN THREAD\n");
 			break;
 		}
 		if(std::cin.eof()){
-			fprintf(stderr, "End of message. SIGNAL RECEIVED BY MAIN THREAD\n");
+			fprintf(stderr, "End of message. seqNum:%d  data:%s\n\n\n\n", sendNextSeqNum, line);
 			break;
 		}
 		// keep sending messages, split them into 8byte packages.
@@ -140,17 +161,38 @@ int main(int argc, char *argv[])
 		{
 			// split into packets of at most 8 bytes/chars.
 			string chunk = line.substr(i*8,8);
+
+			// Check if nextSeqNumber is available to send.
+
+			{
+				unique_lock<mutex>windowlock(mSendWindowShifted);
+				if(sendNextSeqNum >= sendBaseSeqNum && sendNextSeqNum <= sendBaseSeqNum+SEND_WINDOW_SIZE-1)
+				{
+					// can send yes,
+					// otherwise must wait for a shift.
+				}
+				else{				
+					fprintf(stderr, "main waiting for WINDOW SHIFT, nextSeqNum: %d\n", sendNextSeqNum);
+					cvSendWindowShifted.wait(windowlock);
+				}
+			}
 			// printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
 			{
 				printf("main waiting fo dataqmutex with chunk: %s\n", chunk);
 				unique_lock<mutex>mlock(dataQueueMutex);
+
+				// Here we need to wait if data packet send queue is FULL.
+				// cvDataQueueNotFull.wait() etc.
 				Packet *p = (Packet *) malloc(sizeof(Packet));
 				strncpy(p->contents, chunk.c_str(), 8);
 				p->isAck = 0;
 				p->seqNumber = sendNextSeqNum;	
+				p->checksum = Fletcher16((uint8_t*)p->contents, 8);
+				fprintf(stderr, "Checksum: %ld seqNo;%d\n", p->checksum, p->seqNumber);
+
 				dataPacketSendQueue.push(p);
 
-				sendNextSeqNum++;
+				sendNextSeqNum = (sendNextSeqNum+1) % SEND_SEQ_NUM_SPACE;
 				fprintf(stderr, "data q not empty SIGNALED by main\n");
 				cvDataNotEmpty.notify_one();
 			}
@@ -188,14 +230,18 @@ void senderAckOnly(int sock)
 			packet = ackPacketSendQueue.front();
 			ackPacketSendQueue.pop();
 		}
+	
 		strncpy(sendbuffer.contents, packet->contents, 8);
 		sendbuffer.isAck = packet->isAck;
 		sendbuffer.seqNumber = packet->seqNumber;
 		if(packet->isAck != 1){
 			fprintf(stderr,"this is a data packet. should not be on ACK queue.\n");
 		}
+		sendbuffer.checksum = packet->checksum;
 
 		free(packet);
+
+
 		// fprintf(stderr, "sending ACK packet\n");
 		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
 						(struct sockaddr *)&trolladdr, len);
@@ -217,33 +263,42 @@ void senderSR(int sock)
 
 	while(1)
 	{
+		// get the package, copy over to our buffer
 		{
-			fprintf(stderr, "waiting on data Q mutex\n");
-			std::unique_lock<std::mutex> mlock(dataQueueMutex);
-			while(dataPacketSendQueue.empty())
+			// fprintf(stderr, "waiting on data Q mutex\n");
 			{
-				fprintf(stderr, "waiting on data queue not empty\n");
-				cvDataNotEmpty.wait(mlock);
+				std::unique_lock<std::mutex> mlock(dataQueueMutex);
+				while(dataPacketSendQueue.empty())
+				{
+					fprintf(stderr, "waiting on data queue not empty\n");
+					cvDataNotEmpty.wait(mlock);
+				}
+				packet = dataPacketSendQueue.front();
+				dataPacketSendQueue.pop();
+		
+				strncpy(sendbuffer.contents, packet->contents, 8);
+				sendbuffer.isAck = packet->isAck;
+				if(packet->isAck != 0){
+					fprintf(stderr, "ACK packet no: %d should not be on data queue.\n", packet->seqNumber);
+				}
+				sendbuffer.seqNumber = packet->seqNumber;
+				sendbuffer.checksum = packet->checksum;
+
+				free(packet);
 			}
-			packet = dataPacketSendQueue.front();
-			dataPacketSendQueue.pop();
-
-			strncpy(sendbuffer.contents, packet->contents, 8);
-
-			sendbuffer.isAck = packet->isAck;
-			if(packet->isAck != 0){
-				fprintf(stderr, "ACK packet no: %d should not be on data queue.\n", packet->seqNumber);
-			}
-			sendbuffer.seqNumber = packet->seqNumber;
-			fprintf(stderr,"sending DATA packet\n");
-
-			free(packet);
+			
+			// senderSrPacketAckStates
 			int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
 							(struct sockaddr *)&trolladdr, len);
 			if (nsent<0) 
 			{
-				perror("[ERROR}server send response error");
+				perror("server send response error");
 				exit(1);
+			}
+			// mark this packet as sent, but not yet ACK'ed and start its timer.
+			{
+				std::unique_lock<std::mutex> ackStateLock(mSendWindowShifted);
+				senderSrPacketAckStates[sendbuffer.seqNumber] = 0;
 			}
 		}
 	}
@@ -281,37 +336,56 @@ void receiverMain(int sock)
 
 		// fprintf(stderr,"<<< incoming message content=%s\n", rcvBuffer.contents);
 		// Check correctness via checksum, ignore/discard if faulty.
+		long calculatedChecksum = Fletcher16((uint8_t*)rcvBuffer.contents, 8);
+		if(calculatedChecksum != rcvBuffer.checksum){
+			fprintf(stderr, "Checksums dont match. calc:%ld send:%ld seqNo:%d", calculatedChecksum, rcvBuffer.checksum, rcvBuffer.seqNumber);
+			continue;
+		}
+
 		if(rcvBuffer.isAck == 1)
 		{
 			// received ACK packet
 			// do as Selective Repeat dictates for SenderSR.
 			// mark packet as ack'ed, shift window size if possible etc.
-			fprintf(stderr, "ReceiverSR received ACK packet: %d for our SenderSR.\n", rcvBuffer.seqNumber);
-			int maxAcceptableSeqNum = sendNextSeqNum-1;
+			// fprintf(stderr, "ReceiverSR received ACK packet: %d for our SenderSR.\n", rcvBuffer.seqNumber);
+			int maxAcceptableSeqNum = sendBaseSeqNum + SEND_WINDOW_SIZE-1;
 			if(rcvBuffer.seqNumber >= sendBaseSeqNum && rcvBuffer.seqNumber <= maxAcceptableSeqNum)
 			{
-				// TODO mark the packet as ack'ed here.
-				senderSrPacketAckStates[rcvBuffer.seqNumber] = 1;
+					{
+						unique_lock<mutex>(mSendWindowShifted);
+						// mark the packet as ack'ed here.
+						senderSrPacketAckStates[rcvBuffer.seqNumber] = 1;
+						if(rcvBuffer.seqNumber == sendBaseSeqNum)
+						{
+							// we can now advance the window
+							int newBaseSeqNum = sendBaseSeqNum;
+							// next base -> smallest un ack'ed seq num
+							for(int i = sendBaseSeqNum; i < sendBaseSeqNum + SEND_WINDOW_SIZE; i++)
+							{
+								if(senderSrPacketAckStates[i] == 1){
+									// this one is ack'ed move one step.
+									newBaseSeqNum = (newBaseSeqNum +1) % SEND_SEQ_NUM_SPACE;
+								}
+								else{
+									break;
+								}
+							}
+							sendBaseSeqNum = newBaseSeqNum;					
+							fprintf(stderr, "after ack'ing no:%d , new send_base:%d\n", rcvBuffer.seqNumber, sendBaseSeqNum);
 
-				if(rcvBuffer.seqNumber == sendBaseSeqNum)
-				{
-					// we can now advance the window
-					// next base -> smallest un ack'ed seq num
-					// this might require SYNC with SenderSR, as it reads base number at some point
-					sendBaseSeqNum++; // TODO fix this
-					// sendNextSeqNum++;
-					// loop thru senderSrPacketAckStates and find the first 0? would that work?
-
-					// let senderSR know that it can now send prev buffered(due to invalid seq num) packets if any.
-					// fprintf(stderr, "Posting send window shift signal\n");
-					// sem_post(&sendWindowShiftedSignal);
-				}
+							// Now need to transmit buffered packages if their seq numbers are in window
+							// Now signal data sender, main thread that it can continue sending data, as the window shifted. new seq numbers are available.
+							cvSendWindowShifted.notify_all();
+							// let senderSR know that it can now send prev buffered(due to invalid seq num) packets if any.
+						}
+						else
+						{
+							// out of window size, why?
+							fprintf(stderr, "[OUT OF WINDOW]ReceiverSR received ACK packet: %d for our SenderSR.\n", rcvBuffer.seqNumber);
+						}
+					}
 			}
-			else
-			{
-				// out of window size, why?
-				fprintf(stderr, "[OUT OF WINDOW]ReceiverSR received ACK packet: %d for our SenderSR.\n", rcvBuffer.seqNumber);
-			}
+			
 		}
 		else if(rcvBuffer.isAck == 0)
 		{
@@ -320,19 +394,20 @@ void receiverMain(int sock)
 			if(rcvBuffer.seqNumber >= rcvBaseSeqNum && rcvBuffer.seqNumber <= maxAcceptableSeqNum)
 			{
 				{
-					fprintf(stderr, "waiting on ackQmut to push ACK packet\n");
+					// fprintf(stderr, "waiting on ackQmut to push ACK packet\n");
 
 					unique_lock<mutex>mlock(ackQueueMutex);
 					Packet *p = (Packet *) malloc(sizeof(Packet));
 					strncpy(p->contents, "0000000", 8);
 					p->isAck = 1;
 					p->seqNumber = rcvBuffer.seqNumber;
+					p->checksum = Fletcher16((uint8_t*)p->contents, 8);
 					ackPacketSendQueue.push(p);
 
 					fprintf(stderr, "Signaled ACK NOT EMPTY\n");
 					cvAckNotEmpty.notify_one();
 				}
-
+				// check if received/buffered before
 				bool alreadyBuffered = false;
 				for(int j = 0; j < RCV_WINDOW_SIZE; j++)
 				{
@@ -382,7 +457,8 @@ void receiverMain(int sock)
 
 								fprintf(stderr, "Deliver packet seqNo: %d, content: %s\n", rcvBaseSeqNum, smallest.contents);
 								// shift receive window
-								rcvBaseSeqNum += 1;
+								// rcvBaseSeqNum += 1;
+								rcvBaseSeqNum = (rcvBaseSeqNum+1) % RCV_SEQ_NUM_SPACE;
 								fprintf(stderr, "rcv base is now:%d\n", rcvBaseSeqNum);
 
 								chatOutput.open(outFilename, std::ios_base::app); // append instead of overwrite
@@ -404,6 +480,7 @@ void receiverMain(int sock)
 				fprintf(stderr,"ACK'ing previously ACK'ed packet. seqNo: %d\n", rcvBuffer.seqNumber);
 				// we have ACK'ed this before, but prob got lost. send ACK again.
 				// send ACK
+
 				{
 					fprintf(stderr, "waiting on ackQmut to push ACK packet PREV ACK\n");
 					unique_lock<mutex>mlock(ackQueueMutex);
@@ -411,6 +488,7 @@ void receiverMain(int sock)
 					strncpy(p->contents, "0000000", 8);
 					p->isAck = 1;
 					p->seqNumber = rcvBuffer.seqNumber;
+					p->checksum = Fletcher16((uint8_t*)p->contents, 8);
 					ackPacketSendQueue.push(p);
 					fprintf(stderr, "ACKNOT EMPT SIGNALED\n");
 

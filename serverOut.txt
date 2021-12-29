@@ -1,1 +1,1 @@
-Data received from above. When data is received from above, the SR senderchecks the next available sequence number for the packetData received from above. When data is received from above, the SR senderchecks the next available sequence number for the packet.If the sequence
+Data received from above. When data is received 
