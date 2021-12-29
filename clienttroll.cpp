@@ -24,6 +24,7 @@ Rest belongs to Doruk Bildibay, e2237089.
 #include <ctype.h>
 #include <netdb.h>
 
+#include <chrono>
 #include <queue>
 #include <string>
 #include <fstream>
@@ -39,7 +40,7 @@ const string outFilename("clientOut.txt");
 void senderAckOnly(int s);
 void senderSR(int s);
 void receiverMain(int s);
-
+void Timers(int sock);
 
 typedef struct Packet {
 	char isAck;
@@ -47,6 +48,11 @@ typedef struct Packet {
 	long checksum;
 	char contents[8];
 } Packet;
+
+typedef struct Timer{
+    chrono::steady_clock::time_point timeSent;
+	Packet* packet;
+} Timer;
 
 // readonly globals?
 struct sockaddr_in trolladdr;
@@ -63,6 +69,8 @@ std::condition_variable cvAckNotEmpty;
 std::condition_variable cvSendWindowShifted;
 mutex mSendWindowShifted;
 
+vector<Timer> timers;
+mutex timersMutex;
 // since this is both sender & receiver, we have two sets of variables for Selective Repeat.
 long sendBaseSeqNum = 0;
 long sendNextSeqNum = 0;
@@ -157,6 +165,7 @@ int main(int argc, char *argv[])
 	thread senderSrThread(senderSR,sock);
 	thread receiverThread(receiverMain, sock);
 	thread senderAckThread(senderAckOnly, sock);
+	thread timersThread(Timers, sock);
 
 	string line;
 	while(true)
@@ -177,9 +186,7 @@ int main(int argc, char *argv[])
 		{
 			// split into packets of at most 8 bytes/chars.
 			string chunk = line.substr(i*8,8);
-
 			// Check if nextSeqNumber is available to send.
-
 			{
 				unique_lock<mutex>windowlock(mSendWindowShifted);
 				if(sendNextSeqNum >= sendBaseSeqNum && sendNextSeqNum <= sendBaseSeqNum+SEND_WINDOW_SIZE-1)
@@ -217,6 +224,7 @@ int main(int argc, char *argv[])
 	senderAckThread.join();
 	senderSrThread.join();
 	senderAckThread.join();
+	timersThread.join();
 
 	close(sock);
 
@@ -254,18 +262,25 @@ void senderAckOnly(int sock)
 		if(packet->isAck != 1){
 			fprintf(stderr,"this is a data packet. should not be on ACK queue.\n");
 		}
-
-		free(packet);
-
-
-		// fprintf(stderr, "sending ACK packet\n");
 		int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
-						(struct sockaddr *)&trolladdr, len);
+							(struct sockaddr *)&trolladdr, len);
 		if (nsent<0) 
 		{
 			perror("server send response error\n");
-			exit(1);
 		}
+		
+		// NO! ACK packets are not responded anyways. only retransmit data.
+		// // register this packet with timers
+		// {
+		// 	unique_lock<mutex> timerlock(timersMutex);
+		// 	// fprintf(stderr, "sending ACK packet\n");
+		// 	Timer timer;
+		// 	timer.packet = packet;
+		// 	timer.timeSent = chrono::steady_clock::now();
+		// 	timers.push_back(timer);
+
+			
+		// }
 	}
 }
 void senderSR(int sock)
@@ -300,25 +315,36 @@ void senderSR(int sock)
 				sendbuffer.seqNumber = packet->seqNumber;
 				sendbuffer.checksum = packet->checksum;
 
-				free(packet);
+				// free(packet);
 			}
 			
 			// senderSrPacketAckStates
-			int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
-							(struct sockaddr *)&trolladdr, len);
-			if (nsent<0) 
-			{
-				perror("server send response error");
-				exit(1);
-			}
 			// mark this packet as sent, but not yet ACK'ed and start its timer.
 			{
 				std::unique_lock<std::mutex> ackStateLock(mSendWindowShifted);
 				senderSrPacketAckStates[sendbuffer.seqNumber] = 0;
 			}
+			// register this packet with timers
+			{
+				unique_lock<mutex> timerlock(timersMutex);
+				// fprintf(stderr, "sending ACK packet\n");
+				Timer timer;
+				timer.packet = packet;
+				timer.timeSent = chrono::steady_clock::now();
+				timers.push_back(timer);
+				int nsent = sendto(sendsock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
+							(struct sockaddr *)&trolladdr, len);
+				if (nsent<0) 
+				{
+					perror("server send response error");
+					// exit(1);
+				}
+			}
+		
 		}
 	}
 }
+
 void receiverMain(int sock)
 {
 	int rcvsock = sock; //*((int *) vargs);
@@ -367,6 +393,28 @@ void receiverMain(int sock)
 			int maxAcceptableSeqNum = sendBaseSeqNum + SEND_WINDOW_SIZE-1;
 			if(rcvBuffer.seqNumber >= sendBaseSeqNum && rcvBuffer.seqNumber <= maxAcceptableSeqNum)
 			{
+
+					// Stop its timer.
+					{
+						unique_lock<mutex>(timersMutex);
+						auto indexToRemove = timers.end();
+						// remove from the timer's list.
+						for(auto it = timers.begin() ; it < timers.end(); it++){
+							if((*it).packet->seqNumber == rcvBuffer.seqNumber)
+							{
+								indexToRemove = it;
+
+								fprintf(stderr,"[DELIVERY CONFIRMED] seqNo: %d\n",it->packet->seqNumber);
+								free(it->packet);
+								break;
+							}
+						}
+						if(indexToRemove != timers.end())
+						{
+							timers.erase(indexToRemove);
+						}
+					}
+					// Then mark as acked and move on.
 					{
 						unique_lock<mutex>(mSendWindowShifted);
 						// mark the packet as ack'ed here.
@@ -400,6 +448,8 @@ void receiverMain(int sock)
 							fprintf(stderr, "[OUT OF WINDOW]ReceiverSR received ACK packet: %d for our SenderSR.\n", rcvBuffer.seqNumber);
 						}
 					}
+
+
 			}
 			
 		}
@@ -407,6 +457,19 @@ void receiverMain(int sock)
 		{
 			// Received data packet, do as needed for ReceiverSR behaviour.
 			int maxAcceptableSeqNum = rcvBaseSeqNum + (RCV_WINDOW_SIZE -1);
+			int lowerLimit = rcvBaseSeqNum - RCV_WINDOW_SIZE;
+
+			bool alternate = false;
+			if(lowerLimit < 0) {
+				alternate = true;
+				lowerLimit += RCV_SEQ_NUM_SPACE;
+			}
+			int upperLimit = rcvBaseSeqNum -1;
+			if(upperLimit < 0){
+				alternate= true;
+				upperLimit += RCV_SEQ_NUM_SPACE;
+			}
+
 			if(rcvBuffer.seqNumber >= rcvBaseSeqNum && rcvBuffer.seqNumber <= maxAcceptableSeqNum)
 			{
 				{
@@ -492,8 +555,28 @@ void receiverMain(int sock)
 				}
 			
 			}
-			else if(rcvBuffer.seqNumber >= (rcvBaseSeqNum - RCV_WINDOW_SIZE) && rcvBuffer.seqNumber <= rcvBaseSeqNum-1)
+			else if(!alternate && rcvBuffer.seqNumber >= lowerLimit && rcvBuffer.seqNumber <= upperLimit)
 			{
+				fprintf(stderr,"ACK'ing previously ACK'ed packet. seqNo: %d\n", rcvBuffer.seqNumber);
+				// we have ACK'ed this before, but prob got lost. send ACK again.
+				// send ACK
+
+				{
+					fprintf(stderr, "waiting on ackQmut to push ACK packet PREV ACK\n");
+					unique_lock<mutex>mlock(ackQueueMutex);
+					Packet *p = (Packet *) malloc(sizeof(Packet));
+					strncpy(p->contents, "0000000", 8);
+					p->isAck = 1;
+					p->seqNumber = rcvBuffer.seqNumber;
+					p->checksum = Fletcher16((uint8_t*)p->contents, 8);
+
+					ackPacketSendQueue.push(p);
+					fprintf(stderr, "ACKNOT EMPT SIGNALED\n");
+
+					cvAckNotEmpty.notify_one();
+				}
+			}
+			else if(alternate && (rcvBuffer.seqNumber >= lowerLimit || rcvBuffer.seqNumber <= upperLimit)){
 				fprintf(stderr,"ACK'ing previously ACK'ed packet. seqNo: %d\n", rcvBuffer.seqNumber);
 				// we have ACK'ed this before, but prob got lost. send ACK again.
 				// send ACK
@@ -515,12 +598,55 @@ void receiverMain(int sock)
 			}
 			else
 			{
-				fprintf(stderr, "packet ignored seqNum: %d, rcvbase:%d\n", rcvBuffer.seqNumber, rcvBaseSeqNum);
+				fprintf(stderr, "packet ignored seqNum: %d, rcvbase:%d lower: %d  upper:%d\n", rcvBuffer.seqNumber, rcvBaseSeqNum,
+				lowerLimit, upperLimit);
 			}
 		}
 		else
 		{
 			fprintf(stderr, "invalid isAck field: %d\n", rcvBuffer.isAck);
 		}
+	}
+}
+
+
+void Timers(int sock)
+{
+	// 50 ms timer for each.
+	int64_t timeout = 50;
+
+	Packet sendbuffer;	
+	socklen_t len = sizeof(trolladdr);
+
+	while(1)
+	{
+		{
+			unique_lock<mutex> mlock(timersMutex);
+			for(int i = 0; i < timers.size(); i++)
+			{
+				chrono::steady_clock::time_point begin = chrono::steady_clock::now();
+				chrono::steady_clock::time_point currTime = chrono::steady_clock::now();
+				auto timePassed = chrono::duration_cast<std::chrono::milliseconds>(currTime - timers[0].timeSent).count();
+				if(timePassed > timeout)
+				{
+					// re transmit these packets.
+					strncpy(sendbuffer.contents, timers[i].packet->contents, 8);
+					sendbuffer.isAck = timers[i].packet->isAck;
+					sendbuffer.seqNumber = timers[i].packet->seqNumber;
+					sendbuffer.checksum = timers[i].packet->checksum;
+
+					// POSSIBLE ERROR POINT, sync sendto() calls!
+					int nsent = sendto(sock, (char *)&sendbuffer, sizeof(sendbuffer), 0,
+						(struct sockaddr *)&trolladdr, len);
+					if (nsent<0) 
+					{
+						perror("Timer retransmit packet error");
+					}
+					// restart this timer as well.
+					timers[i].timeSent = chrono::steady_clock::now();
+				}
+			}
+		}
+		std::this_thread::sleep_for(10ms);
 	}
 }
